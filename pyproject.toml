@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "topdock"
+version = "0.2.1"
+description = "⚡ Docker Stats Dashboard for your terminal"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "docker>=6.1.0",
+    "rich>=13.7.0",
+]
+
+[project.scripts]
+topdock = "topdock:main"
+
+[tool.setuptools]
+py-modules = ["topdock"]
