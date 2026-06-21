@@ -61,6 +61,11 @@ pipx uninstall topdock
 # or
 pip uninstall topdock
 ```
+---
+
+## Contributing
+
+Found a bug or want a feature? Open an issue or PR on [GitHub](https://github.com/nishantverse/topdock).
 
 ---
 
