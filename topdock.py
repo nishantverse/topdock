@@ -3,12 +3,13 @@
 TopDock - Docker Stats Dashboard
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 import sys
 import time
 import json
 import csv
+import signal
 import threading
 import argparse
 from datetime import datetime
@@ -79,6 +80,15 @@ def bytes_to_human(n: float) -> str:
             return f"{n:6.1f} {unit}"
         n /= 1024.0
     return f"{n:.1f} PB"
+
+def bytes_short(n: float) -> str:
+    """Compact bytes string without padding, e.g. '55.3KB'."""
+    n = max(0.0, n)
+    for unit in ("B", "K", "M", "G", "T"):
+        if n < 1024.0:
+            return f"{n:.0f}{unit}" if n < 10 else f"{n:.0f}{unit}"
+        n /= 1024.0
+    return f"{n:.0f}P"
 
 def calc_cpu_percent(stats: dict) -> float:
     try:
@@ -214,6 +224,24 @@ def sort_stats(data: list[dict], sort_by: str) -> list[dict]:
     return sorted(data, key=lambda x: x.get(key, default), reverse=rev)
 
 # ─────────────────────────────────────────────
+#  RESPONSIVE LAYOUT HELPERS
+# ─────────────────────────────────────────────
+
+def _bar_width(term_width: int) -> int:
+    """Scale the progress-bar block count to terminal width."""
+    if term_width >= 200:
+        return 10
+    if term_width >= 150:
+        return 8
+    if term_width >= 100:
+        return 6
+    return 4
+
+def _is_compact(term_width: int) -> bool:
+    """Use compact labels below this width."""
+    return term_width < 160
+
+# ─────────────────────────────────────────────
 #  RENDERING
 # ─────────────────────────────────────────────
 
@@ -244,8 +272,8 @@ def make_header(sort_by: str, alert_count: int, total: int, refresh: float,
                 docker_ok: bool) -> Panel:
     now = datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
     title = Text()
-    title.append("⚡ DOCK", style=f"bold {THEME['accent']}")
-    title.append("WATCH", style=f"bold {THEME['accent2']}")
+    title.append("⚡ TOP", style=f"bold {THEME['accent']}")
+    title.append("DOCK", style=f"bold {THEME['accent2']}")
     title.append("  //  ", style=THEME["muted"])
     title.append(now, style=THEME["accent3"])
 
@@ -273,7 +301,12 @@ def make_header(sort_by: str, alert_count: int, total: int, refresh: float,
     )
 
 def make_table(data: list[dict], sort_by: str, scroll_offset: int,
-               visible_rows: int, selected: int) -> Table:
+               visible_rows: int, selected: int,
+               term_width: int = 200) -> Table:
+    bw      = _bar_width(term_width)
+    compact = _is_compact(term_width)
+    bfmt    = bytes_short if compact else bytes_to_human
+
     t = Table(
         box=box.SIMPLE_HEAD,
         border_style=THEME["border"],
@@ -281,17 +314,19 @@ def make_table(data: list[dict], sort_by: str, scroll_offset: int,
         style=THEME["text"],
         show_edge=True,
         expand=True,
-        padding=(0, 1),
+        padding=(0, 0) if compact else (0, 1),
     )
-    t.add_column("●",              width=12)
-    t.add_column("CONTAINER",      min_width=16, style=f"bold {THEME['accent3']}")
-    t.add_column("ID",             width=10,     style=THEME["muted"])
-    t.add_column("IMAGE",          min_width=14, style=THEME["muted"], overflow="fold")
-    t.add_column("CPU %",          min_width=20)
-    t.add_column("MEM %",          min_width=20)
-    t.add_column("MEM USED/LIMIT", min_width=18, justify="right")
-    t.add_column("NET ↓/↑",        min_width=20, justify="right")
-    t.add_column("BLK R/W",        min_width=18, justify="right")
+
+    # All 9 columns always visible — ratio-based so they scale to any width
+    t.add_column("●",         ratio=2)
+    t.add_column("CONTAINER", ratio=2, overflow="ellipsis", style=f"bold {THEME['accent3']}")
+    t.add_column("ID",        ratio=1, overflow="ellipsis", style=THEME["muted"])
+    t.add_column("IMAGE",     ratio=2, overflow="ellipsis", style=THEME["muted"])
+    t.add_column("CPU %",     ratio=2, overflow="ellipsis")
+    t.add_column("MEM %",     ratio=2, overflow="ellipsis")
+    t.add_column("MEM U/L",   ratio=2, overflow="ellipsis")
+    t.add_column("NET ↓/↑",   ratio=2, overflow="ellipsis")
+    t.add_column("BLK R/W",   ratio=2, overflow="ellipsis")
 
     if not data:
         t.add_row(
@@ -313,32 +348,33 @@ def make_table(data: list[dict], sort_by: str, scroll_offset: int,
             sel_prefix.append("▶ ", style=f"bold {THEME['accent']}")
         sel_prefix.append_text(status_dot(row["status"]))
 
+        img = row["image"]
+        max_img = 26 if not compact else 14
+        if len(img) > max_img:
+            img = img[:max_img - 1] + "…"
+
         mem_label = Text()
-        mem_label.append(bytes_to_human(row["mem_used"]), style=THEME["text"])
-        mem_label.append(" / ", style=THEME["muted"])
-        mem_label.append(bytes_to_human(row["mem_lim"]), style=THEME["muted"])
+        mem_label.append(bfmt(row["mem_used"]), style=THEME["text"])
+        mem_label.append("/", style=THEME["muted"])
+        mem_label.append(bfmt(row["mem_lim"]), style=THEME["muted"])
 
         net_label = Text()
-        net_label.append(f"↓{bytes_to_human(row['net_rx'])}", style=THEME["ok"])
-        net_label.append(" / ", style=THEME["muted"])
-        net_label.append(f"↑{bytes_to_human(row['net_tx'])}", style=THEME["warn"])
+        net_label.append(f"↓{bfmt(row['net_rx'])}", style=THEME["ok"])
+        net_label.append("/", style=THEME["muted"])
+        net_label.append(f"↑{bfmt(row['net_tx'])}", style=THEME["warn"])
 
         blk_label = Text()
-        blk_label.append(f"R:{bytes_to_human(row['blk_r'])}", style=THEME["accent3"])
-        blk_label.append(" / ", style=THEME["muted"])
-        blk_label.append(f"W:{bytes_to_human(row['blk_w'])}", style=THEME["warn"])
-
-        img = row["image"]
-        if len(img) > 26:
-            img = img[:23] + "…"
+        blk_label.append(f"R:{bfmt(row['blk_r'])}", style=THEME["accent3"])
+        blk_label.append("/", style=THEME["muted"])
+        blk_label.append(f"W:{bfmt(row['blk_w'])}", style=THEME["warn"])
 
         t.add_row(
             sel_prefix,
             Text(row["name"], style=f"bold {THEME['accent3']}"),
             Text(row["id"],   style=THEME["muted"]),
             Text(img,         style=THEME["muted"]),
-            pct_bar(row["cpu_pct"], THEME["cpu_bar"]),
-            pct_bar(row["mem_pct"], THEME["mem_bar"]),
+            pct_bar(row["cpu_pct"], THEME["cpu_bar"], width=bw),
+            pct_bar(row["mem_pct"], THEME["mem_bar"], width=bw),
             mem_label,
             net_label,
             blk_label,
@@ -348,7 +384,7 @@ def make_table(data: list[dict], sort_by: str, scroll_offset: int,
     # scrollbar
     if len(data) > visible_rows:
         pct = scroll_offset / max(len(data) - visible_rows, 1)
-        bar_len = 24
+        bar_len = max(12, min(24, term_width // 6))
         pos = int(pct * (bar_len - 1))
         sc = Text()
         sc.append("─" * pos,              style=THEME["muted"])
@@ -416,9 +452,6 @@ def export_json(data: list[dict], path: str = "topdock_export.json") -> str | No
 #  LIVE DASHBOARD
 # ─────────────────────────────────────────────
 
-# approximate fixed UI rows: header(4) + alerts(9) + help(3) + table borders(2)
-_FIXED_UI_ROWS = 18
-
 def run_dashboard(client: docker.DockerClient, refresh: float,
                   sort_by: str, alert_threshold: float) -> None:
     global ALERT_THRESHOLD
@@ -435,8 +468,22 @@ def run_dashboard(client: docker.DockerClient, refresh: float,
     docker_ok     = True
     quit_event    = threading.Event()
 
+    def _get_layout_sizes(term_height: int, alert_count: int):
+        """Compute proportional panel heights from live terminal height."""
+        header_h = 4
+        help_h   = 3
+        alert_h  = min(alert_count + 3, 9) if alert_count > 0 else 3
+        main_h   = max(5, term_height - header_h - help_h - alert_h)
+        return header_h, main_h, alert_h, help_h
+
     def _vis_rows() -> int:
-        return max(1, console.size.height - _FIXED_UI_ROWS)
+        """Visible table rows = main panel height minus table border overhead."""
+        h = console.size.height
+        with _alerts_lock:
+            nalerts = len(_alerts)
+        _, main_h, _, _ = _get_layout_sizes(h, nalerts)
+        # subtract table panel border (2) + table header row (2)
+        return max(1, main_h - 4)
 
     def _clamp() -> None:
         """Clamp selected/scroll_offset to valid range. Must hold state_lock."""
@@ -556,6 +603,19 @@ def run_dashboard(client: docker.DockerClient, refresh: float,
 
     # ── layout builder ────────────────────────────────────────────────────
     def build() -> Layout:
+        w = console.size.width
+        h = console.size.height
+
+        # ── terminal too small — show minimal fallback ──
+        if h < 12 or w < 60:
+            return Layout(
+                Panel(
+                    Text("⚡ Terminal too small — zoom out or resize",
+                         justify="center", style=f"bold {THEME['warn']}"),
+                    border_style=THEME["accent"],
+                )
+            )
+
         with state_lock:
             data    = list(last_data)
             sel     = selected
@@ -566,21 +626,21 @@ def run_dashboard(client: docker.DockerClient, refresh: float,
             etimer  = export_timer
             _clamp()
 
-        vis   = _vis_rows()
         nalerts = len(_alerts)
-        # FIX: alert panel size is dynamic, not hardcoded
-        alert_size = min(nalerts + 3, 9) if nalerts > 0 else 3
+        header_h, main_h, alert_h, help_h = _get_layout_sizes(h, nalerts)
+        vis = _vis_rows()
 
         layout = Layout()
         layout.split_column(
             Layout(make_header(sort, nalerts, len(data), refresh,
-                               offset, vis, dok), size=4),
-            Layout(Panel(make_table(data, sort, offset, vis, sel),
+                               offset, vis, dok), size=header_h),
+            Layout(Panel(make_table(data, sort, offset, vis, sel,
+                                    term_width=w),
                          border_style=THEME["border"],
                          style=f"on {THEME['bg']}",
-                         padding=(0, 0)), name="main"),
-            Layout(make_alerts_panel(), size=alert_size),
-            Layout(make_help_bar(emsg, etimer), size=3),
+                         padding=(0, 0)), name="main", size=main_h),
+            Layout(make_alerts_panel(), size=alert_h),
+            Layout(make_help_bar(emsg, etimer), size=help_h),
         )
         return layout
 
@@ -588,25 +648,43 @@ def run_dashboard(client: docker.DockerClient, refresh: float,
     inp_thread = threading.Thread(target=input_loop, daemon=True)
     inp_thread.start()
 
-    with Live(build(), refresh_per_second=4, screen=True, console=console) as live:
-        next_fetch = 0.0
-        while not quit_event.is_set():
-            now = time.time()
-            if now >= next_fetch:
-                try:
-                    new_data = sort_stats(get_all_stats(client), sort_by)
+    # ── handle terminal resize signal (SIGWINCH) on Unix ───────────────
+    resize_flag = threading.Event()
+    _prev_sigwinch = None
+    if hasattr(signal, "SIGWINCH"):
+        def _on_resize(signum, frame):
+            resize_flag.set()
+        _prev_sigwinch = signal.getsignal(signal.SIGWINCH)
+        signal.signal(signal.SIGWINCH, _on_resize)
+
+    try:
+        with Live(build(), refresh_per_second=4, screen=True, console=console) as live:
+            next_fetch = 0.0
+            while not quit_event.is_set():
+                now = time.time()
+                if now >= next_fetch:
+                    try:
+                        new_data = sort_stats(get_all_stats(client), sort_by)
+                        with state_lock:
+                            docker_ok  = True
+                            last_data  = new_data
+                            # preserve sort that may have changed interactively
+                            sort_by    = current_sort
+                            _clamp()
+                    except Exception:
+                        with state_lock:
+                            docker_ok = False
+                    next_fetch = now + refresh
+                # On resize, force an immediate re-clamp + redraw
+                if resize_flag.is_set():
+                    resize_flag.clear()
                     with state_lock:
-                        docker_ok  = True
-                        last_data  = new_data
-                        # preserve sort that may have changed interactively
-                        sort_by    = current_sort
                         _clamp()
-                except Exception:
-                    with state_lock:
-                        docker_ok = False
-                next_fetch = now + refresh
-            live.update(build())
-            time.sleep(0.1)
+                live.update(build())
+                time.sleep(0.1)
+    finally:
+        if _prev_sigwinch is not None:
+            signal.signal(signal.SIGWINCH, _prev_sigwinch or signal.SIG_DFL)
 
     quit_event.set()
     inp_thread.join(timeout=2)
@@ -630,7 +708,8 @@ def run_snapshot(client: docker.DockerClient, sort_by: str, fmt: str) -> None:
         else:
             console.print(f"[bold {THEME['crit']}]✗ Export failed.[/]")
     else:
-        table = make_table(data, sort_by, 0, len(data), -1)
+        table = make_table(data, sort_by, 0, len(data), -1,
+                            term_width=console.size.width)
         console.print(Panel(table,
             title=f"[bold {THEME['accent']}]⚡ TOPDOCK SNAPSHOT[/]",
             border_style=THEME["accent"]))
